@@ -15,6 +15,7 @@ import { ARM_FEATURES_H } from './arm-features.h'
 import { getNapiConfig } from './consts'
 import { debugFactory } from './debug'
 import { createJsBinding } from './js-binding-template'
+import { createWasiBinding } from './load-wasi-template'
 import { getHostTargetTriple, parseTriple } from './parse-triple'
 import {
   copyFileAsync,
@@ -562,9 +563,12 @@ export class BuildCommand extends Command {
           cargoArtifactName = `lib${cargoArtifactName}`
           libExt = '.so'
           break
+        case 'wasi':
+          libExt = '.wasm'
+          break
         default:
           throw new TypeError(
-            'Operating system not currently supported or recognized by the build script',
+            `Operating system ${platform} not currently supported or recognized by the build script`,
           )
       }
     }
@@ -590,9 +594,10 @@ export class BuildCommand extends Command {
       : ''
 
     debug(`Platform name: ${platformName || chalk.green('[Empty]')}`)
+    const ext = platform === 'wasi' ? '.wasm' : '.node'
     const distFileName = this.bin
       ? cargoArtifactName!
-      : `${binaryName}${platformName}.node`
+      : `${binaryName}${platformName}${ext}`
 
     const distModulePath = join(this.destDir ?? '.', distFileName)
 
@@ -641,6 +646,21 @@ export class BuildCommand extends Command {
         this.noDtsHeader,
         tsConstEnum,
       )
+      const wasiRegisterFunctions =
+        triple.arch === 'wasm32'
+          ? JSON.parse(
+              await readFileAsync(intermediateWasiRegisterFile, 'utf8').catch(
+                (err) => {
+                  console.warn(
+                    `Read ${chalk.yellowBright(
+                      intermediateWasiRegisterFile,
+                    )} failed, reason: ${err.message}`,
+                  )
+                  return `[]`
+                },
+              ),
+            )
+          : []
       await writeJsBinding(
         binaryName,
         this.jsPackageName ?? packageName,
@@ -663,6 +683,14 @@ export class BuildCommand extends Command {
           }
         }
         const pipeCommand = `${this.pipe} ${dtsFilePath}`
+      await writeWasiBinding(
+        binaryName,
+        wasiRegisterFunctions,
+        jsBindingFilePath,
+        idents,
+      )
+      if (this.pipe && jsBindingFilePath) {
+        const pipeCommand = `${this.pipe} ${jsBindingFilePath}`
         console.info(`Run ${chalk.green(pipeCommand)}`)
         try {
           execSync(pipeCommand, { stdio: 'inherit', env: commandEnv })
@@ -883,6 +911,33 @@ async function writeJsBinding(
     await writeFileAsync(
       distFileName,
       template + declareCodes + exportsCode + '\n',
+      'utf8',
+    )
+  }
+}
+
+async function writeWasiBinding(
+  localName: string,
+  wasiRegisterFunctions: string[],
+  distFileName: string | null,
+  idents: string[],
+) {
+  if (distFileName && wasiRegisterFunctions.length) {
+    const { name, dir } = parse(distFileName)
+    const newPath = join(dir, `${name}.wasi.mjs`)
+    const declareCodes = `const { ${idents
+      .map((ident) => `${ident}: _${ident}`)
+      .join(', ')} } = binding\n`
+    const exportsCode = idents.reduce(
+      (acc, cur) => `${acc}\nexport const ${cur} = _${cur}`,
+      '',
+    )
+    await writeFileAsync(
+      newPath,
+      createWasiBinding(localName, wasiRegisterFunctions) +
+        declareCodes +
+        exportsCode +
+        '\n',
       'utf8',
     )
   }
